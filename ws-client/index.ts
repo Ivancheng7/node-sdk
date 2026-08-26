@@ -324,6 +324,10 @@ export class WSClient {
         timer = setTimeout(() => {
           this.logger.error('[ws]', `handshake timeout after ${this.handshakeTimeoutMs}ms`);
           wsInstance!.removeAllListeners();
+          // `ws` emits an asynchronous error when a CONNECTING socket is
+          // terminated. Keep one listener after cleanup so the timeout does
+          // not become an uncaught exception.
+          wsInstance!.once('error', () => {});
           try { wsInstance!.terminate(); } catch { /* best effort */ }
           settleOnce(false);
         }, this.handshakeTimeoutMs);
@@ -688,6 +692,9 @@ export class WSClient {
     const wsInstance = this.wsConfig.getWSInstance();
     if (wsInstance) {
       wsInstance.removeAllListeners();
+      if (wsInstance.readyState === WebSocket.CONNECTING) {
+        wsInstance.once('error', () => {});
+      }
       if (force) {
         wsInstance.terminate();
       } else {

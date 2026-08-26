@@ -44,25 +44,42 @@ const flushPromises = () => new Promise<void>(r => setImmediate(r));
 // ---------------------------------------------------------------------------
 
 jest.mock('ws', () => {
+  const CONNECTING = 0;
   const OPEN = 1;
   class MockWebSocket {
+    static CONNECTING = CONNECTING;
     static OPEN = OPEN;
-    readyState = OPEN;
+    static instances: MockWebSocket[] = [];
+    readyState = CONNECTING;
     private listeners: Record<string, Function[]> = {};
+    terminate = jest.fn(() => {
+      setImmediate(() => this.emit('error', new Error('WebSocket was closed before the connection was established')));
+    });
+    constructor() {
+      MockWebSocket.instances.push(this);
+    }
     on(event: string, fn: Function) {
       (this.listeners[event] ||= []).push(fn);
+    }
+    once(event: string, fn: Function) {
+      const wrapper = (...args: any[]) => {
+        this.listeners[event] = (this.listeners[event] || []).filter(listener => listener !== wrapper);
+        fn(...args);
+      };
+      this.on(event, wrapper);
     }
     removeAllListeners() {
       this.listeners = {};
     }
     emit(event: string, ...args: any[]) {
-      (this.listeners[event] || []).forEach(fn => fn(...args));
+      const listeners = this.listeners[event] || [];
+      if (event === 'error' && listeners.length === 0) throw args[0];
+      listeners.slice().forEach(fn => fn(...args));
     }
     send(_data: any, cb?: (err?: Error) => void) {
       cb?.();
     }
     close() {}
-    terminate() {}
   }
   return { __esModule: true, default: MockWebSocket };
 });
@@ -568,8 +585,10 @@ describe('pingTimeout liveness watchdog', () => {
 // ---------------------------------------------------------------------------
 
 describe('handshakeTimeoutMs', () => {
-    test('hung handshake → terminate called, connect resolves false, retry kicks in', async () => {
+    test('hung handshake → terminate is guarded, connect resolves false, retry kicks in', async () => {
         const http = createMockHttpInstance();
+        const MockWebSocket = jest.requireMock('ws').default;
+        const instanceIndex = MockWebSocket.instances.length;
         const client = new WSClient({
             appId: 'cli_0000000000000001',
             appSecret: 'secret',
@@ -589,8 +608,27 @@ describe('handshakeTimeoutMs', () => {
         await delay(120);
         await flushPromises();
 
+        expect(MockWebSocket.instances[instanceIndex].terminate).toHaveBeenCalledTimes(1);
         expect(http.request).toHaveBeenCalledTimes(2);
     }, 10000);
+
+    test('force-closing a connecting socket keeps its late error handled', async () => {
+        const http = createMockHttpInstance();
+        const client = new WSClient({
+            appId: 'cli_0000000000000001',
+            appSecret: 'secret',
+            loggerLevel: 4,
+            httpInstance: http as any,
+        });
+        const MockWebSocket = jest.requireMock('ws').default;
+        const socket = new MockWebSocket();
+        (client as any).wsConfig.setWSInstance(socket);
+
+        client.close({ force: true });
+        await flushPromises();
+
+        expect(socket.terminate).toHaveBeenCalledTimes(1);
+    });
 
     test('unset handshakeTimeoutMs preserves original "no timeout" behavior', async () => {
         const http = createMockHttpInstance();
