@@ -79,7 +79,13 @@ jest.mock('ws', () => {
     send(_data: any, cb?: (err?: Error) => void) {
       cb?.();
     }
-    close() {}
+    // Real `ws` routes close() on a non-OPEN socket through abortHandshake()
+    // too, so it emits the same late error as terminate().
+    close = jest.fn(() => {
+      if (this.readyState === CONNECTING) {
+        setImmediate(() => this.emit('error', new Error('WebSocket was closed before the connection was established')));
+      }
+    });
   }
   return { __esModule: true, default: MockWebSocket };
 });
@@ -130,37 +136,96 @@ function createMockHttpInstance() {
 // Tests
 // ---------------------------------------------------------------------------
 
+// `MockWebSocket.instances` is a module-level array that would otherwise grow
+// across tests — including from reconnect loops still running after a test
+// returns — making any `instances[n]` index unreliable.
+beforeEach(() => {
+  jest.requireMock('ws').default.instances.length = 0;
+});
+
 describe('WSClient reconnect timer leak (#177)', () => {
-  function createClient(httpMock: ReturnType<typeof createMockHttpInstance>) {
+  function createClient(
+    httpMock: ReturnType<typeof createMockHttpInstance>,
+    overrides: Record<string, unknown> = {},
+  ) {
     return new WSClient({
       appId: 'cli_0000000000000001',
       appSecret: 'test-app-secret',
       loggerLevel: 4,
       httpInstance: httpMock as any,
       autoReconnect: true,
-    });
+      ...overrides,
+    } as any);
   }
 
-  test('close() + start() during in-flight tryConnect should NOT spawn orphaned loop', async () => {
+  test('close() during an in-flight first handshake must not resurrect the client', async () => {
+    // The isStart branch of reConnect() awaits tryConnect(). A close() landing
+    // during that await used to be invisible to it: reconnectGeneration only
+    // invalidates *older* loops, and the reConnect() it calls on a retryable
+    // failure bumps the generation itself — so a closed client restarted its
+    // own retry loop, kept a non-unref'd pingLoop timer alive, and never
+    // re-armed the DataCache sweep (only start() does that).
+    const httpMock = createMockHttpInstance();
+    const client = createClient(httpMock, { handshakeTimeoutMs: 50 });
+    const priv = client as any;
+
+    client.start({ eventDispatcher: new EventDispatcher({} as any) });
+    await flushPromises();
+    expect(httpMock.pendingRequests.length).toBe(1);
+
+    httpMock.resolveNext(true);   // pullConnectConfig succeeds
+    await flushPromises();        // connect() is now waiting on the handshake
+
+    // Caller gives up while the handshake is still in flight. getWSInstance()
+    // is still null here (it is only set on 'open'), so close() cannot reach
+    // the socket — all it can do is mark the client closed.
+    client.close();
+    expect(priv.closed).toBe(true);
+
+    // Watchdog fires -> connect() resolves false -> tryConnect() returns a
+    // retryable failure -> the abandoned isStart branch resumes.
+    await delay(120);
+    await flushPromises();
+    await delay(50);
+    await flushPromises();
+
+    // No new pullConnectConfig: the retry loop was never started.
+    expect(httpMock.pendingRequests.length).toBe(0);
+    expect(httpMock.request).toHaveBeenCalledTimes(1);
+    expect(priv.reconnectInterval).toBeUndefined();
+  }, 10000);
+
+  test('a handshake that wins the race with close() is torn down, not adopted', async () => {
+    // The generation counter alone cannot handle this case: it says "someone
+    // else moved on" but not *who*, so it must leave wsConfig's socket alone.
+    // Only the explicit `closed` flag proves nobody restarted the client, which
+    // is what makes discarding the socket safe here.
     const httpMock = createMockHttpInstance();
     const client = createClient(httpMock);
-    const dispatcher = new EventDispatcher({} as any);
+    const priv = client as any;
+    const onReady = jest.fn();
+    priv.onReady = onReady;
 
-    // Step 1: Start and establish connection
-    client.start({ eventDispatcher: dispatcher });
-    expect(httpMock.pendingRequests.length).toBe(1);
-    httpMock.resolveNext(true); // pullConnectConfig succeeds
+    client.start({ eventDispatcher: new EventDispatcher({} as any) });
     await flushPromises();
-    // connect() creates MockWebSocket which emits 'open' synchronously via constructor
-    // Actually our mock doesn't auto-emit open. We need to trigger it.
-    // Let's check: connect() does `new WebSocket(url)` then listens for 'open'
-    // Our mock doesn't auto-emit. Let's fix by making connect resolve.
-    // Actually the MockWebSocket's 'open' is never emitted... Let me adjust.
+    httpMock.resolveNext(true);
+    await flushPromises();
 
-    // The wsConfig should have an instance set if connect succeeded.
-    // Since MockWebSocket doesn't emit 'open', connect() hangs.
-    // Let's take a different approach: directly test the reConnect logic
-    // by accessing private methods through type casting.
+    const MockWebSocket = jest.requireMock('ws').default;
+    const socket = MockWebSocket.instances[MockWebSocket.instances.length - 1];
+    expect(socket).toBeDefined();
+
+    // Caller closes while the handshake is in flight...
+    client.close();
+    // ...and only then does the peer complete it.
+    socket.emit('open');
+    await flushPromises();
+    await flushPromises();
+
+    // The connection must not be adopted by a client the caller closed.
+    expect(onReady).not.toHaveBeenCalled();
+    expect(socket.terminate).toHaveBeenCalledTimes(1);
+    expect(priv.wsConfig.getWSInstance()).toBeNull();
   }, 10000);
 
   test('generation counter prevents stale loops from continuing', async () => {
@@ -610,24 +675,48 @@ describe('handshakeTimeoutMs', () => {
 
         expect(MockWebSocket.instances[instanceIndex].terminate).toHaveBeenCalledTimes(1);
         expect(http.request).toHaveBeenCalledTimes(2);
+
+        // autoReconnect is on: without this the loop keeps creating sockets
+        // (and pushing them into MockWebSocket.instances) during later tests.
+        client.close();
     }, 10000);
 
-    test('force-closing a connecting socket keeps its late error handled', async () => {
-        const http = createMockHttpInstance();
-        const client = new WSClient({
-            appId: 'cli_0000000000000001',
-            appSecret: 'secret',
-            loggerLevel: 4,
-            httpInstance: http as any,
+    // close() detaches every listener before tearing the socket down, so the
+    // error `ws` emits a tick later has nowhere to land unless a sink is left
+    // behind. Both branches — terminate() and close() — need one.
+    describe.each([
+        { label: 'force', params: { force: true }, method: 'terminate' as const },
+        { label: 'graceful', params: {}, method: 'close' as const },
+    ])('closing a connecting socket keeps its late error handled ($label)', ({ params, method }) => {
+        test('no exception escapes to the process', async () => {
+            const http = createMockHttpInstance();
+            const client = new WSClient({
+                appId: 'cli_ABCDEF0123456789',
+                appSecret: 'secret',
+                loggerLevel: 4,
+                httpInstance: http as any,
+            });
+            const MockWebSocket = jest.requireMock('ws').default;
+            const socket = new MockWebSocket();
+            (client as any).wsConfig.setWSInstance(socket);
+
+            // Assert the real guarantee explicitly. Without it the only signal
+            // is Jest's own uncaughtException handling, which can attribute the
+            // failure to whichever test happens to be running at the time.
+            const escaped: Error[] = [];
+            const collect = (err: Error) => escaped.push(err);
+            process.on('uncaughtException', collect);
+            try {
+                client.close(params);
+                await flushPromises();
+                await flushPromises();
+            } finally {
+                process.off('uncaughtException', collect);
+            }
+
+            expect(socket[method]).toHaveBeenCalledTimes(1);
+            expect(escaped).toHaveLength(0);
         });
-        const MockWebSocket = jest.requireMock('ws').default;
-        const socket = new MockWebSocket();
-        (client as any).wsConfig.setWSInstance(socket);
-
-        client.close({ force: true });
-        await flushPromises();
-
-        expect(socket.terminate).toHaveBeenCalledTimes(1);
     });
 
     test('unset handshakeTimeoutMs preserves original "no timeout" behavior', async () => {
